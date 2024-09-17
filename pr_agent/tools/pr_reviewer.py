@@ -6,7 +6,7 @@ from typing import List, Tuple
 from jinja2 import Environment, StrictUndefined
 from pr_agent.algo.ai_handlers.base_ai_handler import BaseAiHandler
 from pr_agent.algo.ai_handlers.litellm_ai_handler import LiteLLMAIHandler
-from pr_agent.algo.pr_processing import get_pr_diff, retry_with_fallback_models
+from pr_agent.algo.pr_processing import get_pr_diff, retry_with_fallback_models, add_ai_metadata_to_diff_files
 from pr_agent.algo.token_handler import TokenHandler
 from pr_agent.algo.utils import github_action_output, load_yaml, ModelType, \
     show_relevant_configurations, convert_to_markdown_v2, PRReviewHeader
@@ -51,15 +51,23 @@ class PRReviewer:
             raise Exception(f"Answer mode is not supported for {get_settings().config.git_provider} for now")
         self.ai_handler = ai_handler()
         self.ai_handler.main_pr_language = self.main_language
-
         self.patches_diff = None
         self.prediction = None
-
         answer_str, question_str = self._get_user_answers()
+        self.pr_description, self.pr_description_files = (
+            self.git_provider.get_pr_description(split_changes_walkthrough=True))
+        if (self.pr_description_files and get_settings().get("config.is_auto_command", False) and
+                get_settings().get("config.enable_ai_metadata", False)):
+            add_ai_metadata_to_diff_files(self.git_provider, self.pr_description_files)
+            get_logger().debug(f"AI metadata added to the this command")
+        else:
+            get_settings().set("config.enable_ai_metadata", False)
+            get_logger().debug(f"AI metadata is disabled for this command")
+
         self.vars = {
             "title": self.git_provider.pr.title,
             "branch": self.git_provider.get_pr_branch(),
-            "description": self.git_provider.get_pr_description(),
+            "description": self.pr_description,
             "language": self.main_language,
             "diff": "",  # empty diff for initial calculation
             "num_pr_files": self.git_provider.get_num_of_files(),
@@ -75,7 +83,7 @@ class PRReviewer:
             "commit_messages_str": self.git_provider.get_commit_messages(),
             "custom_labels": "",
             "enable_custom_labels": get_settings().config.enable_custom_labels,
-            "extra_issue_links": get_settings().pr_reviewer.extra_issue_links,
+            "is_ai_metadata":  get_settings().get("config.enable_ai_metadata", False),
         }
 
         self.token_handler = TokenHandler(
@@ -96,6 +104,10 @@ class PRReviewer:
 
     async def run(self) -> None:
         try:
+            if not self.git_provider.get_files():
+                get_logger().info(f"PR has no files: {self.pr_url}, skipping review")
+                return None
+
             if self.incremental.is_incremental and not self._can_run_incremental_review():
                 return None
 
@@ -158,7 +170,7 @@ class PRReviewer:
             get_logger().debug(f"PR diff", diff=self.patches_diff)
             self.prediction = await self._get_prediction(model)
         else:
-            get_logger().error(f"Error getting PR diff")
+            get_logger().warning(f"Empty diff for PR: {self.pr_url}")
             self.prediction = None
 
     async def _get_prediction(self, model: str) -> str:
@@ -180,7 +192,7 @@ class PRReviewer:
 
         response, finish_reason = await self.ai_handler.chat_completion(
             model=model,
-            temperature=0.2,
+            temperature=get_settings().config.temperature,
             system=system_prompt,
             user=user_prompt
         )
@@ -287,7 +299,7 @@ class PRReviewer:
                 if comment:
                     comments.append(comment)
             else:
-                self.git_provider.publish_inline_comment(content, relevant_file, relevant_line_in_file)
+                self.git_provider.publish_inline_comment(content, relevant_file, relevant_line_in_file, suggestion)
 
         if comments:
             self.git_provider.publish_inline_comments(comments)
@@ -377,6 +389,11 @@ class PRReviewer:
     def set_review_labels(self, data):
         if not get_settings().config.publish_output:
             return
+
+        if not get_settings().pr_reviewer.require_estimate_effort_to_review:
+            get_settings().pr_reviewer.enable_review_labels_effort = False # we did not generate this output
+        if not get_settings().pr_reviewer.require_security_review:
+            get_settings().pr_reviewer.enable_review_labels_security = False # we did not generate this output
 
         if (get_settings().pr_reviewer.enable_review_labels_security or
                 get_settings().pr_reviewer.enable_review_labels_effort):

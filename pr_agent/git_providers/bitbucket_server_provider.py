@@ -1,10 +1,9 @@
-import json
+from distutils.version import LooseVersion
+from requests.exceptions import HTTPError
 from typing import Optional, Tuple
 from urllib.parse import quote_plus, urlparse
 
-import requests
 from atlassian.bitbucket import Bitbucket
-from starlette_context import context
 
 from .git_provider import GitProvider
 from ..algo.types import EDIT_TYPE, FilePatchInfo
@@ -16,19 +15,9 @@ from ..log import get_logger
 
 class BitbucketServerProvider(GitProvider):
     def __init__(
-        self, pr_url: Optional[str] = None, incremental: Optional[bool] = False
+            self, pr_url: Optional[str] = None, incremental: Optional[bool] = False,
+            bitbucket_client: Optional[Bitbucket] = None,
     ):
-        s = requests.Session()
-        try:
-            bearer = context.get("bitbucket_bearer_token", None)
-            s.headers["Authorization"] = f"Bearer {bearer}"
-        except Exception:
-            s.headers[
-                "Authorization"
-            ] = f'Bearer {get_settings().get("BITBUCKET_SERVER.BEARER_TOKEN", None)}'
-
-        s.headers["Content-Type"] = "application/json"
-        self.headers = s.headers
         self.bitbucket_server_url = None
         self.workspace_slug = None
         self.repo_slug = None
@@ -42,24 +31,30 @@ class BitbucketServerProvider(GitProvider):
         self.bitbucket_pull_request_api_url = pr_url
 
         self.bitbucket_server_url = self._parse_bitbucket_server(url=pr_url)
-        self.bitbucket_client = Bitbucket(url=self.bitbucket_server_url,
-                                          token=get_settings().get("BITBUCKET_SERVER.BEARER_TOKEN", None))
+        self.bitbucket_client = bitbucket_client or Bitbucket(url=self.bitbucket_server_url,
+                                                              token=get_settings().get("BITBUCKET_SERVER.BEARER_TOKEN",
+                                                                                       None))
+        try:
+            self.bitbucket_api_version = LooseVersion(self.bitbucket_client.get("rest/api/1.0/application-properties").get('version'))
+        except Exception:
+            self.bitbucket_api_version = None
 
         if pr_url:
             self.set_pr(pr_url)
 
     def get_repo_settings(self):
         try:
-            url = (f"{self.bitbucket_server_url}/projects/{self.workspace_slug}/repos/{self.repo_slug}/src/"
-                   f"{self.pr.destination_branch}/.pr_agent.toml")
-            response = requests.request("GET", url, headers=self.headers)
-            if response.status_code == 404:  # not found
-                return ""
-            contents = response.text.encode('utf-8')
-            return contents
-        except Exception:
+            content = self.bitbucket_client.get_content_of_file(self.workspace_slug, self.repo_slug, ".pr_agent.toml", self.get_pr_branch())
+
+            return content
+        except Exception as e:
+            if isinstance(e, HTTPError):
+                if e.response.status_code == 404:  # not found
+                    return ""
+
+            get_logger().error(f"Failed to load .pr_agent.toml file, error: {e}")
             return ""
-        
+
     def get_pr_id(self):
         return self.pr_num
 
@@ -91,6 +86,8 @@ class BitbucketServerProvider(GitProvider):
                 continue
 
             if relevant_lines_end > relevant_lines_start:
+                # Bitbucket does not support multi-line suggestions so use a code block instead - https://jira.atlassian.com/browse/BSERV-4553
+                body = body.replace("```suggestion", "```")
                 post_parameters = {
                     "body": body,
                     "path": relevant_file,
@@ -115,8 +112,11 @@ class BitbucketServerProvider(GitProvider):
                 get_logger().error(f"Failed to publish code suggestion, error: {e}")
             return False
 
+    def publish_file_comments(self, file_comments: list) -> bool:
+        pass
+
     def is_supported(self, capability: str) -> bool:
-        if capability in ['get_issue_comments', 'get_labels', 'gfm_markdown']:
+        if capability in ['get_issue_comments', 'get_labels', 'gfm_markdown', 'publish_file_comments']:
             return False
         return True
 
@@ -131,7 +131,7 @@ class BitbucketServerProvider(GitProvider):
                                                                      self.repo_slug,
                                                                      path,
                                                                      commit_id)
-        except requests.HTTPError as e:
+        except HTTPError as e:
             get_logger().debug(f"File {path} not found at commit id: {commit_id}")
         return file_content
 
@@ -140,12 +140,50 @@ class BitbucketServerProvider(GitProvider):
         diffstat = [change["path"]['toString'] for change in changes]
         return diffstat
 
+    #gets the best common ancestor: https://git-scm.com/docs/git-merge-base
+    @staticmethod
+    def get_best_common_ancestor(source_commits_list, destination_commits_list, guaranteed_common_ancestor) -> str:
+        destination_commit_hashes = {commit['id'] for commit in destination_commits_list} | {guaranteed_common_ancestor}
+
+        for commit in source_commits_list:
+            for parent_commit in commit['parents']:
+                if parent_commit['id'] in destination_commit_hashes:
+                    return parent_commit['id']
+
+        return guaranteed_common_ancestor
+
     def get_diff_files(self) -> list[FilePatchInfo]:
         if self.diff_files:
             return self.diff_files
 
-        base_sha = self.pr.toRef['latestCommit']
         head_sha = self.pr.fromRef['latestCommit']
+
+        # if Bitbucket api version is >= 8.16 then use the merge-base api for 2-way diff calculation
+        if self.bitbucket_api_version is not None and self.bitbucket_api_version >= LooseVersion("8.16"):
+            try:
+                base_sha = self.bitbucket_client.get(self._get_merge_base())['id']
+            except Exception as e:
+                get_logger().error(f"Failed to get the best common ancestor for PR: {self.pr_url}, \nerror: {e}")
+                raise e
+        else:
+            source_commits_list = list(self.bitbucket_client.get_pull_requests_commits(
+                self.workspace_slug,
+                self.repo_slug,
+                self.pr_num
+            ))
+            # if Bitbucket api version is None or < 7.0 then do a simple diff with a guaranteed common ancestor
+            base_sha = source_commits_list[-1]['parents'][0]['id']
+            # if Bitbucket api version is 7.0-8.15 then use 2-way diff functionality for the base_sha
+            if self.bitbucket_api_version is not None and self.bitbucket_api_version >= LooseVersion("7.0"):
+                try:
+                    destination_commits = list(
+                        self.bitbucket_client.get_commits(self.workspace_slug, self.repo_slug, base_sha,
+                                                          self.pr.toRef['latestCommit']))
+                    base_sha = self.get_best_common_ancestor(source_commits_list, destination_commits, base_sha)
+                except Exception as e:
+                    get_logger().error(
+                        f"Failed to get the commit list for calculating best common ancestor for PR: {self.pr_url}, \nerror: {e}")
+                    raise e
 
         diff_files = []
         original_file_content_str = ""
@@ -230,7 +268,7 @@ class BitbucketServerProvider(GitProvider):
         path = relevant_file.strip()
         return dict(body=body, path=path, position=absolute_position) if subject_type == "LINE" else {}
 
-    def publish_inline_comment(self, comment: str, from_line: int, file: str):
+    def publish_inline_comment(self, comment: str, from_line: int, file: str, original_suggestion=None):
         payload = {
             "text": comment,
             "severity": "NORMAL",
@@ -244,10 +282,17 @@ class BitbucketServerProvider(GitProvider):
         }
 
         try:
-            requests.post(url=self._get_pr_comments_url(), json=payload, headers=self.headers).raise_for_status()
+            self.bitbucket_client.post(self._get_pr_comments_path(), data=payload)
         except Exception as e:
             get_logger().error(f"Failed to publish inline comment to '{file}' at line {from_line}, error: {e}")
             raise e
+
+    def get_line_link(self, relevant_file: str, relevant_line_start: int, relevant_line_end: int = None) -> str:
+        if relevant_line_start == -1:
+            link = f"{self.pr_url}/diff#{quote_plus(relevant_file)}"
+        else:
+            link = f"{self.pr_url}/diff#{quote_plus(relevant_file)}?t={relevant_line_start}"
+        return link
 
     def generate_link_to_relevant_line_number(self, suggestion) -> str:
         try:
@@ -284,10 +329,10 @@ class BitbucketServerProvider(GitProvider):
         for comment in comments:
             if 'position' in comment:
                 self.publish_inline_comment(comment['body'], comment['position'], comment['path'])
-            elif 'start_line' in comment: # multi-line comment
+            elif 'start_line' in comment:  # multi-line comment
                 # note that bitbucket does not seem to support range - only a comment on a single line - https://community.developer.atlassian.com/t/api-post-endpoint-for-inline-pull-request-comments/60452
                 self.publish_inline_comment(comment['body'], comment['start_line'], comment['path'])
-            elif 'line' in comment: # single-line comment
+            elif 'line' in comment:  # single-line comment
                 self.publish_inline_comment(comment['body'], comment['line'], comment['path'])
             else:
                 get_logger().error(f"Could not publish inline comment: {comment}")
@@ -300,6 +345,9 @@ class BitbucketServerProvider(GitProvider):
 
     def get_pr_branch(self):
         return self.pr.fromRef['displayId']
+
+    def get_pr_owner_id(self) -> str | None:
+        return self.workspace_slug
 
     def get_pr_description_full(self):
         if hasattr(self.pr, "description"):
@@ -323,14 +371,29 @@ class BitbucketServerProvider(GitProvider):
 
     @staticmethod
     def _parse_bitbucket_server(url: str) -> str:
+        # pr url format: f"{bitbucket_server}/projects/{project_name}/repos/{repository_name}/pull-requests/{pr_id}"
         parsed_url = urlparse(url)
+        server_path = parsed_url.path.split("/projects/")
+        if len(server_path) > 1:
+            server_path = server_path[0].strip("/")
+            return f"{parsed_url.scheme}://{parsed_url.netloc}/{server_path}".strip("/")
         return f"{parsed_url.scheme}://{parsed_url.netloc}"
 
     @staticmethod
     def _parse_pr_url(pr_url: str) -> Tuple[str, str, int]:
+        # pr url format: f"{bitbucket_server}/projects/{project_name}/repos/{repository_name}/pull-requests/{pr_id}"
         parsed_url = urlparse(pr_url)
+
         path_parts = parsed_url.path.strip("/").split("/")
-        if len(path_parts) < 6 or path_parts[4] != "pull-requests":
+
+        try:
+            projects_index = path_parts.index("projects")
+        except ValueError as e:
+            raise ValueError(f"The provided URL '{pr_url}' does not appear to be a Bitbucket PR URL")
+
+        path_parts = path_parts[projects_index:]
+
+        if len(path_parts) < 6 or path_parts[2] != "repos" or path_parts[4] != "pull-requests":
             raise ValueError(
                 f"The provided URL '{pr_url}' does not appear to be a Bitbucket PR URL"
             )
@@ -350,37 +413,44 @@ class BitbucketServerProvider(GitProvider):
         return self.repo
 
     def _get_pr(self):
-        pr = self.bitbucket_client.get_pull_request(self.workspace_slug, self.repo_slug, pull_request_id=self.pr_num)
-        return type('new_dict', (object,), pr)
+        try:
+            pr = self.bitbucket_client.get_pull_request(self.workspace_slug, self.repo_slug,
+                                                        pull_request_id=self.pr_num)
+            return type('new_dict', (object,), pr)
+        except Exception as e:
+            get_logger().error(f"Failed to get pull request, error: {e}")
+            raise e
 
     def _get_pr_file_content(self, remote_link: str):
         return ""
 
     def get_commit_messages(self):
-        def get_commit_messages(self):
-            raise NotImplementedError("Get commit messages function not implemented yet.")
+        return ""
+
     # bitbucket does not support labels
     def publish_description(self, pr_title: str, description: str):
         payload = {
             "version": self.pr.version,
             "description": description,
             "title": pr_title,
-            "reviewers": self.pr.reviewers # needs to be sent otherwise gets wiped
+            "reviewers": self.pr.reviewers  # needs to be sent otherwise gets wiped
         }
         try:
             self.bitbucket_client.update_pull_request(self.workspace_slug, self.repo_slug, str(self.pr_num), payload)
         except Exception as e:
             get_logger().error(f"Failed to update pull request, error: {e}")
             raise e
-        
 
     # bitbucket does not support labels
     def publish_labels(self, pr_types: list):
         pass
-    
+
     # bitbucket does not support labels
     def get_pr_labels(self, update=False):
         pass
 
-    def _get_pr_comments_url(self):
-        return f"{self.bitbucket_server_url}/rest/api/latest/projects/{self.workspace_slug}/repos/{self.repo_slug}/pull-requests/{self.pr_num}/comments"
+    def _get_pr_comments_path(self):
+        return f"rest/api/latest/projects/{self.workspace_slug}/repos/{self.repo_slug}/pull-requests/{self.pr_num}/comments"
+
+    def _get_merge_base(self):
+        return f"rest/api/latest/projects/{self.workspace_slug}/repos/{self.repo_slug}/pull-requests/{self.pr_num}/merge-base"

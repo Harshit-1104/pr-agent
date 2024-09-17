@@ -44,7 +44,7 @@ Commands for invoking the different tools via comments:
 
 - **Review**:       `/review`
 - **Describe**:     `/describe`
-- **Improve**:      `/improve`
+- **Improve**:      `/improve`  (or `/improve_code` for bitbucket, since `/improve` is sometimes reserved)
 - **Ask**:          `/ask "..."`
 - **Reflect**:      `/reflect`
 - **Update Changelog**:      `/update_changelog`
@@ -93,13 +93,6 @@ To cancel the automatic run of all the tools, set:
 [github_app]
 pr_commands = []
 ```
-
-You can also disable automatic runs for PRs with specific titles, by setting the `ignore_pr_titles` parameter with the relevant regex. For example:
-```
-[github_app]
-ignore_pr_title = ["^[Auto]", ".*ignore.*"]
-```
-will ignore PRs with titles that start with "Auto" or contain the word "ignore".
 
 ### GitHub app automatic tools for push actions (commits to an open PR)
 
@@ -182,6 +175,12 @@ inline_code_comments = true
 ```
 
 Each time you invoke a `/review` tool, it will use inline code comments.
+
+
+Note that among other limitations, BitBucket provides relatively low rate-limits for applications (up to 1000 requests per hour), and does not provide an API to track the actual rate-limit usage.
+If you experience lack of responses from PR-Agent, you might want to set: `bitbucket_app.avoid_full_files=true` in your configuration file.
+This will prevent PR-Agent from acquiring the full file content, and will only use the diff content. This will reduce the number of requests made to BitBucket, at the cost of small decrease in accuracy, as dynamic context will not be applicable.
+
 
 ### BitBucket Self-Hosted App automatic tools
 

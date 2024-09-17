@@ -1,5 +1,7 @@
 from __future__ import annotations
+import html2text
 
+import html
 import copy
 import difflib
 import json
@@ -147,7 +149,7 @@ def convert_to_markdown_v2(output_data: dict,
             else:
                 markdown_text += f"### {emoji} {key_nice}: {value}\n\n"
         elif 'relevant tests' in key_nice.lower():
-            value = value.strip().lower()
+            value = str(value).strip().lower()
             if gfm_supported:
                 markdown_text += f"<tr><td>"
                 if is_value_no(value):
@@ -175,7 +177,7 @@ def convert_to_markdown_v2(output_data: dict,
                     markdown_text += f'### {emoji} No security concerns identified\n\n'
                 else:
                     markdown_text += f"### {emoji} Security concerns\n\n"
-                    value = emphasize_header(value.strip())
+                    value = emphasize_header(value.strip(), only_markdown=True)
                     markdown_text += f"{value}\n\n"
         elif 'can be split' in key_nice.lower():
             if gfm_supported:
@@ -213,19 +215,6 @@ def convert_to_markdown_v2(output_data: dict,
                         reference_link = git_provider.get_line_link(relevant_file, start_line, end_line)
 
                         if gfm_supported:
-                            if get_settings().pr_reviewer.extra_issue_links:
-                                issue_content_linked =copy.deepcopy(issue_content)
-                                referenced_variables_list = issue.get('referenced_variables', [])
-                                for component in referenced_variables_list:
-                                    name = component['variable_name'].strip().strip('`')
-
-                                    ind = issue_content.find(name)
-                                    if ind != -1:
-                                        reference_link_component = git_provider.get_line_link(relevant_file, component['relevant_line'], component['relevant_line'])
-                                        issue_content_linked = issue_content_linked[:ind-1] + f"[`{name}`]({reference_link_component})" + issue_content_linked[ind+len(name)+1:]
-                                    else:
-                                        get_logger().info(f"Failed to find variable in issue content: {component['variable_name'].strip()}")
-                                issue_content = issue_content_linked
                             issue_str = f"<a href='{reference_link}'><strong>{issue_header}</strong></a><br>{issue_content}"
                         else:
                             issue_str = f"[**{issue_header}**]({reference_link})\n\n{issue_content}\n\n"
@@ -557,12 +546,17 @@ def _fix_key_value(key: str, value: str):
 
 
 def load_yaml(response_text: str, keys_fix_yaml: List[str] = [], first_key="", last_key="") -> dict:
-    response_text = response_text.removeprefix('```yaml').rstrip('`')
+    response_text = response_text.strip('\n').removeprefix('```yaml').rstrip().removesuffix('```')
     try:
         data = yaml.safe_load(response_text)
     except Exception as e:
-        get_logger().error(f"Failed to parse AI prediction: {e}")
+        get_logger().warning(f"Initial failure to parse AI prediction: {e}")
         data = try_fix_yaml(response_text, keys_fix_yaml=keys_fix_yaml, first_key=first_key, last_key=last_key)
+        if not data:
+            get_logger().error(f"Failed to parse AI prediction after fallbacks", artifact={'response_text': response_text})
+        else:
+            get_logger().info(f"Successfully parsed AI prediction after fallbacks",
+                              artifact={'response_text': response_text})
     return data
 
 
@@ -579,9 +573,9 @@ def try_fix_yaml(response_text: str,
     response_text_lines_copy = response_text_lines.copy()
     for i in range(0, len(response_text_lines_copy)):
         for key in keys_yaml:
-            if key in response_text_lines_copy[i] and not '|-' in response_text_lines_copy[i]:
+            if key in response_text_lines_copy[i] and not '|' in response_text_lines_copy[i]:
                 response_text_lines_copy[i] = response_text_lines_copy[i].replace(f'{key}',
-                                                                                  f'{key} |-\n        ')
+                                                                                  f'{key} |\n        ')
     try:
         data = yaml.safe_load('\n'.join(response_text_lines_copy))
         get_logger().info(f"Successfully parsed AI prediction after adding |-\n")
@@ -674,14 +668,16 @@ def get_user_labels(current_labels: List[str] = None):
     Only keep labels that has been added by the user
     """
     try:
+        enable_custom_labels = get_settings().config.get('enable_custom_labels', False)
+        custom_labels = get_settings().get('custom_labels', [])
         if current_labels is None:
             current_labels = []
         user_labels = []
         for label in current_labels:
             if label.lower() in ['bug fix', 'tests', 'enhancement', 'documentation', 'other']:
                 continue
-            if get_settings().config.enable_custom_labels:
-                if label in get_settings().custom_labels:
+            if enable_custom_labels:
+                if label in custom_labels:
                     continue
             user_labels.append(label)
         if user_labels:
@@ -693,15 +689,25 @@ def get_user_labels(current_labels: List[str] = None):
 
 
 def get_max_tokens(model):
+    """
+    Get the maximum number of tokens allowed for a model.
+    logic:
+    (1) If the model is in './pr_agent/algo/__init__.py', use the value from there.
+    (2) else, the user needs to define explicitly 'config.custom_model_max_tokens'
+
+    For both cases, we further limit the number of tokens to 'config.max_model_tokens' if it is set.
+    This aims to improve the algorithmic quality, as the AI model degrades in performance when the input is too long.
+    """
     settings = get_settings()
     if model in MAX_TOKENS:
         max_tokens_model = MAX_TOKENS[model]
+    elif settings.config.custom_model_max_tokens > 0:
+        max_tokens_model = settings.config.custom_model_max_tokens
     else:
-        raise Exception(f"MAX_TOKENS must be set for model {model} in ./pr_agent/algo/__init__.py")
+        raise Exception(f"Ensure {model} is defined in MAX_TOKENS in ./pr_agent/algo/__init__.py or set a positive value for it in config.custom_model_max_tokens")
 
-    if settings.config.max_model_tokens:
+    if settings.config.max_model_tokens and settings.config.max_model_tokens > 0:
         max_tokens_model = min(settings.config.max_model_tokens, max_tokens_model)
-        # get_logger().debug(f"limiting max tokens to {max_tokens_model}")
     return max_tokens_model
 
 
@@ -753,6 +759,7 @@ def replace_code_tags(text):
     """
     Replace odd instances of ` with <code> and even instances of ` with </code>
     """
+    text = html.escape(text)
     parts = text.split('`')
     for i in range(1, len(parts), 2):
         parts[i] = '<code>' + parts[i] + '</code>'
@@ -768,6 +775,9 @@ def find_line_number_of_relevant_line_in_file(diff_files: List[FilePatchInfo],
         absolute_position = -1
     re_hunk_header = re.compile(
         r"^@@ -(\d+)(?:,(\d+))? \+(\d+)(?:,(\d+))? @@[ ]?(.*)")
+
+    if not diff_files:
+        return position, absolute_position
 
     for file in diff_files:
         if file.filename and (file.filename.strip() == relevant_file):
@@ -895,21 +905,24 @@ def github_action_output(output_data: dict, key_name: str):
 
 
 def show_relevant_configurations(relevant_section: str) -> str:
-    forbidden_keys = ['ai_disclaimer', 'ai_disclaimer_title', 'ANALYTICS_FOLDER', 'secret_provider',
+    skip_keys = ['ai_disclaimer', 'ai_disclaimer_title', 'ANALYTICS_FOLDER', 'secret_provider', "skip_keys",
                       'trial_prefix_message', 'no_eligible_message', 'identity_provider', 'ALLOWED_REPOS','APP_NAME']
+    extra_skip_keys = get_settings().config.get('config.skip_keys', [])
+    if extra_skip_keys:
+        skip_keys.extend(extra_skip_keys)
 
     markdown_text = ""
     markdown_text += "\n<hr>\n<details> <summary><strong>🛠️ Relevant configurations:</strong></summary> \n\n"
     markdown_text +="<br>These are the relevant [configurations](https://github.com/Codium-ai/pr-agent/blob/main/pr_agent/settings/configuration.toml) for this tool:\n\n"
     markdown_text += f"**[config**]\n```yaml\n\n"
     for key, value in get_settings().config.items():
-        if key in forbidden_keys:
+        if key in skip_keys:
             continue
         markdown_text += f"{key}: {value}\n"
     markdown_text += "\n```\n"
     markdown_text += f"\n**[{relevant_section}]**\n```yaml\n\n"
     for key, value in get_settings().get(relevant_section, {}).items():
-        if key in forbidden_keys:
+        if key in skip_keys:
             continue
         markdown_text += f"{key}: {value}\n"
     markdown_text += "\n```"
@@ -923,3 +936,73 @@ def is_value_no(value):
     if value_str == 'no' or value_str == 'none' or value_str == 'false':
         return True
     return False
+
+
+def process_description(description_full: str) -> Tuple[str, List]:
+    if not description_full:
+        return "", []
+
+    split_str = "### **Changes walkthrough** 📝"
+    description_split = description_full.split(split_str)
+    base_description_str = description_split[0]
+    changes_walkthrough_str = ""
+    files = []
+    if len(description_split) > 1:
+        changes_walkthrough_str = description_split[1]
+    else:
+        get_logger().debug("No changes walkthrough found")
+
+    try:
+        if changes_walkthrough_str:
+            # get the end of the table
+            if '</table>\n\n___' in changes_walkthrough_str:
+                end = changes_walkthrough_str.index("</table>\n\n___")
+            elif '\n___' in changes_walkthrough_str:
+                end = changes_walkthrough_str.index("\n___")
+            else:
+                end = len(changes_walkthrough_str)
+            changes_walkthrough_str = changes_walkthrough_str[:end]
+
+            h = html2text.HTML2Text()
+            h.body_width = 0  # Disable line wrapping
+
+            # find all the files
+            pattern = r'<tr>\s*<td>\s*(<details>\s*<summary>(.*?)</summary>(.*?)</details>)\s*</td>'
+            files_found = re.findall(pattern, changes_walkthrough_str, re.DOTALL)
+            for file_data in files_found:
+                try:
+                    if isinstance(file_data, tuple):
+                        file_data = file_data[0]
+                    pattern = r'<details>\s*<summary><strong>(.*?)</strong>\s*<dd><code>(.*?)</code>.*?</summary>\s*<hr>\s*(.*?)\s*<li>(.*?)</details>'
+                    res = re.search(pattern, file_data, re.DOTALL)
+                    if not res or res.lastindex != 4:
+                        pattern_back = r'<details>\s*<summary><strong>(.*?)</strong><dd><code>(.*?)</code>.*?</summary>\s*<hr>\s*(.*?)\n\n\s*(.*?)</details>'
+                        res = re.search(pattern_back, file_data, re.DOTALL)
+                    if res and res.lastindex == 4:
+                        short_filename = res.group(1).strip()
+                        short_summary = res.group(2).strip()
+                        long_filename = res.group(3).strip()
+                        long_summary =  res.group(4).strip()
+                        long_summary = long_summary.replace('<br> *', '\n*').replace('<br>','').replace('\n','<br>')
+                        long_summary = h.handle(long_summary).strip()
+                        if long_summary.startswith('\\-'):
+                            long_summary = "* " + long_summary[2:]
+                        elif not long_summary.startswith('*'):
+                            long_summary = f"* {long_summary}"
+
+                        files.append({
+                            'short_file_name': short_filename,
+                            'full_file_name': long_filename,
+                            'short_summary': short_summary,
+                            'long_summary': long_summary
+                        })
+                    else:
+                        get_logger().error(f"Failed to parse description", artifact={'description': file_data})
+                except Exception as e:
+                    get_logger().exception(f"Failed to process description: {e}", artifact={'description': file_data})
+
+
+    except Exception as e:
+        get_logger().exception(f"Failed to process description: {e}")
+
+    return base_description_str, files

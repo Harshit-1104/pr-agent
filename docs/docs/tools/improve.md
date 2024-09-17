@@ -1,9 +1,16 @@
 ## Overview
-The `improve` tool scans the PR code changes, and automatically generates suggestions for improving the PR code.
+The `improve` tool scans the PR code changes, and automatically generates [meaningful](https://github.com/Codium-ai/pr-agent/blob/main/pr_agent/settings/pr_code_suggestions_prompts.toml#L41) suggestions for improving the PR code.
 The tool can be triggered automatically every time a new PR is [opened](../usage-guide/automations_and_usage.md#github-app-automatic-tools-when-a-new-pr-is-opened), or it can be invoked manually by commenting on any PR:
 ```
 /improve
 ```
+
+![code_suggestions_as_comment_closed.png](https://codium.ai/images/pr_agent/code_suggestions_as_comment_closed.png){width=512}
+
+![code_suggestions_as_comment_open.png](https://codium.ai/images/pr_agent/code_suggestions_as_comment_open.png){width=512}
+
+Note that the `Apply this suggestion` checkbox, which interactively converts a suggestion into a commitable code comment, is available only for PR-Agent Pro 💎 users.
+
 
 ## Example usage
 
@@ -11,14 +18,12 @@ The tool can be triggered automatically every time a new PR is [opened](../usage
 
 Invoke the tool manually by commenting `/improve` on any PR. The code suggestions by default are presented as a single comment:
 
-![code suggestions as comment](https://codium.ai/images/pr_agent/code_suggestions_as_comment.png){width=512}
-
 To edit [configurations](#configuration-options) related to the improve tool, use the following template:
 ```
 /improve --pr_code_suggestions.some_config1=... --pr_code_suggestions.some_config2=...
 ```
 
-For example, you can choose to present the suggestions as commitable code comments, by running the following command:
+For example, you can choose to present all the suggestions as commitable code comments, by running the following command:
 ```
 /improve --pr_code_suggestions.commitable_code_suggestions=true
 ```
@@ -26,8 +31,8 @@ For example, you can choose to present the suggestions as commitable code commen
 ![improve](https://codium.ai/images/pr_agent/improve.png){width=512}
 
 
-Note that a single comment has a significantly smaller PR footprint. We recommend this mode for most cases.
-Also note that collapsible are not supported in _Bitbucket_. Hence, the suggestions are presented there as code comments.
+As can be seen, a single table comment has a significantly smaller PR footprint. We recommend this mode for most cases.
+Also note that collapsible are not supported in _Bitbucket_. Hence, the suggestions can only be presented in Bitbucket as code comments.
 
 ### Automatic triggering
 
@@ -46,6 +51,22 @@ num_code_suggestions_per_chunk = ...
 
 - The `pr_commands` lists commands that will be executed automatically when a PR is opened.
 - The `[pr_code_suggestions]` section contains the configurations for the `improve` tool you want to edit (if any)
+
+### Assessing Impact 💎
+
+Note that PR-Agent pro tracks two types of implementations:
+
+- Direct implementation - when the user directly applies the suggestion by clicking the `Apply` checkbox.
+- Indirect implementation - when the user implements the suggestion in their IDE environment. In this case, PR-Agent will utilize, after each commit, a dedicated logic to identify if a suggestion was implemented, and will mark it as implemented.
+
+![code_suggestions_asses_impact](https://codium.ai/images/pr_agent/code_suggestions_asses_impact.png){width=512}
+
+In post-process, PR-Agent counts the number of suggestions that were implemented, and provides general statistics and insights about the suggestions' impact on the PR process.
+
+![code_suggestions_asses_impact_stats_1](https://codium.ai/images/pr_agent/code_suggestions_asses_impact_stats_1.png){width=512}
+
+![code_suggestions_asses_impact_stats_2](https://codium.ai/images/pr_agent/code_suggestions_asses_impact_stats_2.png){width=512}
+
 
 ## Usage Tips
 
@@ -158,6 +179,10 @@ Using a combination of both can help the AI model to provide relevant and tailor
     <td><b>enable_help_text</b></td>
     <td>If set to true, the tool will display a help text in the comment. Default is true.</td>
   </tr>
+  <tr>
+    <td><b>enable_chat_text</b></td>
+    <td>If set to true, the tool will display a reference to the PR chat in the comment. Default is true.</td>
+  </tr>
 </table>
 
 !!! example "params for 'extended' mode"
@@ -187,13 +212,12 @@ Using a combination of both can help the AI model to provide relevant and tailor
 
 ## A note on code suggestions quality
 
-- While the current AI for code is getting better and better (GPT-4), it's not flawless. Not all the suggestions will be perfect, and a user should not accept all of them automatically. Critical reading and judgment are required.
+- AI models for code are getting better and better (Sonnet-3.5 and GPT-4), but they are not flawless. Not all the suggestions will be perfect, and a user should not accept all of them automatically. Critical reading and judgment are required.
 - While mistakes of the AI are rare but can happen, a real benefit from the suggestions of the `improve` (and [`review`](https://pr-agent-docs.codium.ai/tools/review/)) tool is to catch, with high probability, **mistakes or bugs done by the PR author**, when they happen. So, it's a good practice to spend the needed ~30-60 seconds to review the suggestions, even if not all of them are always relevant.
 - The hierarchical structure of the suggestions is designed to help the user to _quickly_ understand them, and to decide which ones are relevant and which are not:
 
     - Only if the `Category` header is relevant, the user should move to the summarized suggestion description
     - Only if the summarized suggestion description is relevant, the user should click on the collapsible, to read the full suggestion description with a code preview example.
 
-In addition, we recommend to use the `extra_instructions` field to guide the model to suggestions that are more relevant to the specific needs of the project. 
-<br>
-Consider also trying the [Custom Prompt Tool](./custom_prompt.md) 💎, that will **only** propose code suggestions that follow specific guidelines defined by user.
+- In addition, we recommend to use the [`extra_instructions`](https://pr-agent-docs.codium.ai/tools/improve/#extra-instructions-and-best-practices) field to guide the model to suggestions that are more relevant to the specific needs of the project. 
+- The interactive [PR chat](https://pr-agent-docs.codium.ai/chrome-extension/) also provides an easy way to get more tailored suggestions and feedback from the AI model.

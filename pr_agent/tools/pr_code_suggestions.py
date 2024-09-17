@@ -7,7 +7,8 @@ from jinja2 import Environment, StrictUndefined
 
 from pr_agent.algo.ai_handlers.base_ai_handler import BaseAiHandler
 from pr_agent.algo.ai_handlers.litellm_ai_handler import LiteLLMAIHandler
-from pr_agent.algo.pr_processing import get_pr_diff, get_pr_multi_diffs, retry_with_fallback_models
+from pr_agent.algo.pr_processing import get_pr_diff, get_pr_multi_diffs, retry_with_fallback_models, \
+    add_ai_metadata_to_diff_files
 from pr_agent.algo.token_handler import TokenHandler
 from pr_agent.algo.utils import load_yaml, replace_code_tags, ModelType, show_relevant_configurations
 from pr_agent.config_loader import get_settings
@@ -52,17 +53,29 @@ class PRCodeSuggestions:
         self.ai_handler.main_pr_language = self.main_language
         self.patches_diff = None
         self.prediction = None
+        self.pr_url = pr_url
         self.cli_mode = cli_mode
+        self.pr_description, self.pr_description_files = (
+            self.git_provider.get_pr_description(split_changes_walkthrough=True))
+        if (self.pr_description_files and get_settings().get("config.is_auto_command", False) and
+                get_settings().get("config.enable_ai_metadata", False)):
+            add_ai_metadata_to_diff_files(self.git_provider, self.pr_description_files)
+            get_logger().debug(f"AI metadata added to the this command")
+        else:
+            get_settings().set("config.enable_ai_metadata", False)
+            get_logger().debug(f"AI metadata is disabled for this command")
+
         self.vars = {
             "title": self.git_provider.pr.title,
             "branch": self.git_provider.get_pr_branch(),
-            "description": self.git_provider.get_pr_description(),
+            "description": self.pr_description,
             "language": self.main_language,
             "diff": "",  # empty diff for initial calculation
             "num_code_suggestions": num_code_suggestions,
             "extra_instructions": get_settings().pr_code_suggestions.extra_instructions,
             "commit_messages_str": self.git_provider.get_commit_messages(),
             "relevant_best_practices": "",
+            "is_ai_metadata": get_settings().get("config.enable_ai_metadata", False),
         }
         if 'claude' in get_settings().config.model:
             # prompt for Claude, with minor adjustments
@@ -81,6 +94,10 @@ class PRCodeSuggestions:
 
     async def run(self):
         try:
+            if not self.git_provider.get_files():
+                get_logger().info(f"PR has no files: {self.pr_url}, skipping code suggestions")
+                return None
+
             get_logger().info('Generating code suggestions for PR...')
             relevant_configs = {'pr_code_suggestions': dict(get_settings().pr_code_suggestions),
                                 'config': dict(get_settings().config)}
@@ -99,9 +116,10 @@ class PRCodeSuggestions:
             if not data:
                 data = {"code_suggestions": []}
 
-            if data is None or 'code_suggestions' not in data or not data['code_suggestions']:
-                get_logger().error('No code suggestions found for PR.')
-                pr_body = "## PR Code Suggestions ✨\n\nNo code suggestions found for PR."
+            if (data is None or 'code_suggestions' not in data or not data['code_suggestions']
+                    and get_settings().config.publish_output):
+                get_logger().warning('No code suggestions found for the PR.')
+                pr_body = "## PR Code Suggestions ✨\n\nNo code suggestions found for the PR."
                 get_logger().debug(f"PR output", artifact=pr_body)
                 if self.progress_response:
                     self.git_provider.edit_comment(self.progress_response, body=pr_body)
@@ -159,16 +177,19 @@ class PRCodeSuggestions:
                     self.push_inline_code_suggestions(data)
                     if self.progress_response:
                         self.progress_response.delete()
+            else:
+                get_logger().info('Code suggestions generated for PR, but not published since publish_output is False.')
         except Exception as e:
             get_logger().error(f"Failed to generate code suggestions for PR, error: {e}")
-            if self.progress_response:
-                self.progress_response.delete()
-            else:
-                try:
-                    self.git_provider.remove_initial_comment()
-                    self.git_provider.publish_comment(f"Failed to generate code suggestions for PR")
-                except Exception as e:
-                    pass
+            if get_settings().config.publish_output:
+                if self.progress_response:
+                    self.progress_response.delete()
+                else:
+                    try:
+                        self.git_provider.remove_initial_comment()
+                        self.git_provider.publish_comment(f"Failed to generate code suggestions for PR")
+                    except Exception as e:
+                        pass
 
     def publish_persistent_comment_with_history(self, pr_comment: str,
                                                 initial_header: str,
@@ -177,6 +198,7 @@ class PRCodeSuggestions:
                                                 final_update_message=True,
                                                 max_previous_comments=4,
                                                 progress_response=None):
+
         if isinstance(self.git_provider, AzureDevopsProvider): # get_latest_commit_url is not supported yet
             if progress_response:
                 self.git_provider.edit_comment(progress_response, pr_comment)
@@ -256,7 +278,7 @@ class PRCodeSuggestions:
                         get_logger().info(f"Persistent mode - updating comment {comment_url} to latest {name} message")
                         if progress_response:  # publish to 'progress_response' comment, because it refreshes immediately
                             self.git_provider.edit_comment(progress_response, pr_comment_updated)
-                            self.git_provider.delete_comment(comment)
+                            self.git_provider.remove_comment(comment)
                         else:
                             self.git_provider.edit_comment(comment, pr_comment_updated)
                         return
@@ -286,13 +308,13 @@ class PRCodeSuggestions:
                                         self.token_handler,
                                         model,
                                         add_line_numbers_to_hunks=True,
-                                        disable_extra_lines=True)
+                                        disable_extra_lines=False)
 
         if self.patches_diff:
             get_logger().debug(f"PR diff", artifact=self.patches_diff)
             self.prediction = await self._get_prediction(model, self.patches_diff)
         else:
-            get_logger().error(f"Error getting PR diff")
+            get_logger().warning(f"Empty PR diff")
             self.prediction = None
 
         data = self.prediction
@@ -304,8 +326,8 @@ class PRCodeSuggestions:
         environment = Environment(undefined=StrictUndefined)
         system_prompt = environment.from_string(self.pr_code_suggestions_prompt_system).render(variables)
         user_prompt = environment.from_string(get_settings().pr_code_suggestions_prompt.user).render(variables)
-        response, finish_reason = await self.ai_handler.chat_completion(model=model, temperature=0.2,
-                                                                        system=system_prompt, user=user_prompt)
+        response, finish_reason = await self.ai_handler.chat_completion(
+            model=model, temperature=get_settings().config.temperature, system=system_prompt, user=user_prompt)
 
         # load suggestions from the AI response
         data = self._prepare_pr_code_suggestions(response)
@@ -361,12 +383,14 @@ class PRCodeSuggestions:
         one_sentence_summary_list = []
         for i, suggestion in enumerate(data['code_suggestions']):
             try:
-                needed_keys = ['one_sentence_summary', 'label', 'relevant_file', 'relevant_lines_start', 'relevant_lines_end']
+                needed_keys = ['one_sentence_summary', 'label', 'relevant_file', 'relevant_lines_start',
+                               'relevant_lines_end']
                 is_valid_keys = True
                 for key in needed_keys:
                     if key not in suggestion:
                         is_valid_keys = False
-                        get_logger().debug(f"Skipping suggestion {i + 1}, because it does not contain '{key}':\n'{suggestion}")
+                        get_logger().debug(
+                            f"Skipping suggestion {i + 1}, because it does not contain '{key}':\n'{suggestion}")
                         break
                 if not is_valid_keys:
                     continue
@@ -450,8 +474,24 @@ class PRCodeSuggestions:
             original_initial_line = None
             for file in self.diff_files:
                 if file.filename.strip() == relevant_file:
-                    if file.head_file:  # in bitbucket, head_file is empty. toDo: fix this
-                        original_initial_line = file.head_file.splitlines()[relevant_lines_start - 1]
+                    if file.head_file:
+                        file_lines = file.head_file.splitlines()
+                        if relevant_lines_start > len(file_lines):
+                            get_logger().warning(
+                                "Could not dedent code snippet, because relevant_lines_start is out of range",
+                                artifact={'filename': file.filename,
+                                          'file_content': file.head_file,
+                                          'relevant_lines_start': relevant_lines_start,
+                                          'new_code_snippet': new_code_snippet})
+                            return new_code_snippet
+                        else:
+                            original_initial_line = file_lines[relevant_lines_start - 1]
+                    else:
+                        get_logger().warning("Could not dedent code snippet, because head_file is missing",
+                                             artifact={'filename': file.filename,
+                                                       'relevant_lines_start': relevant_lines_start,
+                                                       'new_code_snippet': new_code_snippet})
+                        return new_code_snippet
                     break
             if original_initial_line:
                 suggested_initial_line = new_code_snippet.splitlines()[0]
@@ -461,7 +501,7 @@ class PRCodeSuggestions:
                 if delta_spaces > 0:
                     new_code_snippet = textwrap.indent(new_code_snippet, delta_spaces * " ").rstrip('\n')
         except Exception as e:
-            get_logger().error(f"Could not dedent code snippet for file {relevant_file}, error: {e}")
+            get_logger().error(f"Error when dedenting code snippet for file {relevant_file}, error: {e}")
 
         return new_code_snippet
 
@@ -496,11 +536,11 @@ class PRCodeSuggestions:
             data = {"code_suggestions": []}
             for j, predictions in enumerate(prediction_list):  # each call adds an element to the list
                 if "code_suggestions" in predictions:
-                    score_threshold = max(1, get_settings().pr_code_suggestions.suggestions_score_threshold)
+                    score_threshold = max(1, int(get_settings().pr_code_suggestions.suggestions_score_threshold))
                     for i, prediction in enumerate(predictions["code_suggestions"]):
                         try:
                             if get_settings().pr_code_suggestions.self_reflect_on_suggestions:
-                                score = int(prediction["score"])
+                                score = int(prediction.get("score", 1))
                                 if score >= score_threshold:
                                     data["code_suggestions"].append(prediction)
                                 else:
@@ -513,7 +553,7 @@ class PRCodeSuggestions:
                             get_logger().error(f"Error getting PR diff for suggestion {i} in call {j}, error: {e}")
             self.data = data
         else:
-            get_logger().error(f"Error getting PR diff")
+            get_logger().warning(f"Empty PR diff list")
             self.data = data = None
         return data
 
@@ -656,6 +696,11 @@ class PRCodeSuggestions:
                     else:
                         pr_body += f"""<tr><td>\n\n"""
                     suggestion_summary = suggestion['one_sentence_summary'].strip().rstrip('.')
+                    if "'<" in suggestion_summary and ">'" in suggestion_summary:
+                        # escape the '<' and '>' characters, otherwise they are interpreted as html tags
+                        get_logger().info(f"Escaped suggestion summary: {suggestion_summary}")
+                        suggestion_summary = suggestion_summary.replace("'<", "`<")
+                        suggestion_summary = suggestion_summary.replace(">'", ">`")
                     if '`' in suggestion_summary:
                         suggestion_summary = replace_code_tags(suggestion_summary)
 

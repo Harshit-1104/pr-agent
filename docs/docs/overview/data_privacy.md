@@ -1,7 +1,6 @@
 ## Self-hosted PR-Agent
 
-- If you host PR-Agent with your OpenAI API key, it is between you and OpenAI. You can read their API data privacy policy here:
-https://openai.com/enterprise-privacy
+- If you self-host PR-Agent with your OpenAI (or other LLM provider) API key, it is between you and the provider. We don't send your code data to PR-Agent servers.
 
 ## PR-Agent Pro 💎
 
@@ -14,4 +13,4 @@ https://openai.com/enterprise-privacy
 
 ## PR-Agent Chrome extension
 
-- The [PR-Agent Chrome extension](https://chromewebstore.google.com/detail/pr-agent-chrome-extension/ephlnjeghhogofkifjloamocljapahnl) serves solely to modify the visual appearance of a GitHub PR screen. It does not transmit any user's repo or pull request code. Code is only sent for processing when a user submits a GitHub comment that activates a PR-Agent tool, in accordance with the standard privacy policy of PR-Agent.
+- The [PR-Agent Chrome extension](https://chromewebstore.google.com/detail/pr-agent-chrome-extension/ephlnjeghhogofkifjloamocljapahnl) will not send your code to any external servers.
