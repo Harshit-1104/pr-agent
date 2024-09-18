@@ -20,7 +20,8 @@ from pr_agent.servers.help import HelpMessage
 from pr_agent.tools.pr_description import insert_br_after_x_chars
 import difflib
 import re
-
+from pr_agent.tracking.pr_agent_jumbo_tracking import get_tracking_object
+from pr_agent.tracking.pr_agent_jumbo_tracking import PRAgentEvent
 
 class PRCodeSuggestions:
     def __init__(self, pr_url: str, cli_mode=False, args: list = None,
@@ -615,6 +616,8 @@ class PRCodeSuggestions:
         return data_sorted
 
     def generate_summarized_suggestions(self, data: Dict) -> str:
+        tracking_object = get_tracking_object()
+        
         try:
             pr_body = "## PR Code Suggestions ✨\n\n"
 
@@ -725,6 +728,15 @@ class PRCodeSuggestions:
 
                     pr_body += f"</td></tr>"
                     counter_suggestions += 1
+                    
+                    tracking_event = PRAgentEvent(
+                        agent_comment=suggestion_summary,
+                        diff_language=self.main_language,
+                        reflection_score=suggestion['score'],
+                        reflection_comment=suggestion['score_why'],
+                    )
+                    
+                    tracking_object.append(tracking_event)
 
                 # pr_body += "</details>"
                 # pr_body += """</td></tr>"""
